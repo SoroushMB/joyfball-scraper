@@ -1,0 +1,16 @@
+[project]
+name = "scrapping-images"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.14.2",
+    "cloudinary>=1.36.0",
+    "flake8>=7.3.0",
+    "matplotlib>=3.10.7",
+    "pandas>=2.3.3",
+    "pillow>=12.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.32.5",
+]
