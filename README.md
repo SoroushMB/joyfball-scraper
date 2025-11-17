@@ -6,11 +6,13 @@ A robust, production-ready Python web scraper that extracts product images from 
 
 - 🖼️ **Image Extraction**: Automatically extracts `.jpg` product images from e-commerce websites
 - 📁 **Collection Organization**: Intelligently categorizes images by collection name extracted from URLs
+- ⚡ **Multi-threaded Processing**: Parallel downloads using multiple worker threads (configurable, default: 5)
 - 💾 **SQLite Caching**: Caches processed products and images to avoid re-processing
 - ☁️ **Cloudinary Integration**: Optional cloud storage upload with automatic organization
 - 🔄 **Resume Capability**: Can stop and resume without re-processing already downloaded images
 - 🛡️ **Error Handling**: Comprehensive error handling with graceful degradation
 - 📊 **Statistics**: Detailed statistics on processed products and images
+- 🔒 **Thread-safe**: All database operations are thread-safe with proper locking
 
 ## Requirements
 
@@ -131,10 +133,18 @@ All errors are logged with descriptive messages, and the scraper continues proce
 
 ## Performance
 
+- **Multi-threading**: Processes multiple products in parallel (default: 5 concurrent threads)
 - **Caching**: Already processed products are skipped automatically
-- **Rate Limiting**: Built-in delay between requests (0.5 seconds)
-- **Database Indexing**: Fast lookups with indexed database queries
+- **Database Indexing**: Fast lookups with indexed database queries with WAL mode for concurrent access
 - **Resume Capability**: Can stop and resume without losing progress
+- **Thread-safe**: All database operations use proper locking mechanisms
+
+### Adjusting Thread Count
+
+You can modify the `MAX_WORKERS` constant in `main.py` to adjust the number of concurrent threads:
+- Lower values (2-3): More conservative, less server load
+- Default (5): Balanced performance
+- Higher values (10+): Faster but may overwhelm the server (use responsibly)
 
 ## Contributing
 

@@ -7,6 +7,7 @@ organizes them by collection, and optionally uploads them to Cloudinary.
 Features:
     - Scrapes product images from specified websites
     - Organizes images by collection name extracted from URLs
+    - Multi-threaded processing for faster downloads
     - Caches processed products and images in SQLite database
     - Optional Cloudinary integration for cloud storage
     - Handles errors gracefully with comprehensive logging
@@ -15,7 +16,8 @@ Features:
 import os
 import re
 import sqlite3
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
 from urllib.parse import urljoin, urlparse
@@ -46,7 +48,10 @@ BASE_URL = "https://www.joyfball.info"
 SAVE_DIR = "images_folder"
 DB_PATH = "scraper_cache.db"
 REQUEST_TIMEOUT = 10
-REQUEST_DELAY = 0.5
+MAX_WORKERS = 5  # Number of concurrent threads for downloading
+
+# Thread-safe database lock
+db_lock = threading.Lock()
 
 # Create save directory if it doesn't exist
 if not os.path.exists(SAVE_DIR):
@@ -436,17 +441,20 @@ def init_db() -> None:
 
 def get_db_connection() -> sqlite3.Connection:
     """
-    Get a database connection.
+    Get a database connection with thread-safe check_same_thread=False.
 
     Returns:
         SQLite database connection
     """
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Enable WAL mode for better concurrent access
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
 
 
 def is_product_processed(product_url: str) -> bool:
     """
-    Check if a product has already been processed.
+    Check if a product has already been processed (thread-safe).
 
     Args:
         product_url: The product URL to check
@@ -455,15 +463,16 @@ def is_product_processed(product_url: str) -> bool:
         True if product is already processed, False otherwise
     """
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT id FROM products WHERE product_url = ?',
-            (product_url,)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        return result is not None
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT id FROM products WHERE product_url = ?',
+                (product_url,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+            return result is not None
     except sqlite3.Error as e:
         print(f"Database error checking product: {e}")
         return False
@@ -476,7 +485,7 @@ def is_image_downloaded(image_url: str,
                         product_url: Optional[str] = None) -> Tuple[
                             bool, Optional[Dict]]:
     """
-    Check if an image has already been downloaded/uploaded.
+    Check if an image has already been downloaded/uploaded (thread-safe).
 
     Args:
         image_url: The image URL to check
@@ -487,33 +496,34 @@ def is_image_downloaded(image_url: str,
         the cached record if exists
     """
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
-        if product_url:
-            cursor.execute('''
-                SELECT local_path, cloudinary_url, downloaded_at, uploaded_at
-                FROM images
-                WHERE image_url = ? AND product_url = ?
-            ''', (image_url, product_url))
-        else:
-            cursor.execute('''
-                SELECT local_path, cloudinary_url, downloaded_at, uploaded_at
-                FROM images
-                WHERE image_url = ?
-            ''', (image_url,))
+            if product_url:
+                cursor.execute('''
+                    SELECT local_path, cloudinary_url, downloaded_at, uploaded_at
+                    FROM images
+                    WHERE image_url = ? AND product_url = ?
+                ''', (image_url, product_url))
+            else:
+                cursor.execute('''
+                    SELECT local_path, cloudinary_url, downloaded_at, uploaded_at
+                    FROM images
+                    WHERE image_url = ?
+                ''', (image_url,))
 
-        result = cursor.fetchone()
-        conn.close()
+            result = cursor.fetchone()
+            conn.close()
 
-        if result:
-            return True, {
-                'local_path': result[0],
-                'cloudinary_url': result[1],
-                'downloaded_at': result[2],
-                'uploaded_at': result[3]
-            }
-        return False, None
+            if result:
+                return True, {
+                    'local_path': result[0],
+                    'cloudinary_url': result[1],
+                    'downloaded_at': result[2],
+                    'uploaded_at': result[3]
+                }
+            return False, None
     except sqlite3.Error as e:
         print(f"Database error checking image: {e}")
         return False, None
@@ -525,7 +535,7 @@ def is_image_downloaded(image_url: str,
 def save_product(product_url: str, collection_name: str,
                  image_found: bool = False) -> None:
     """
-    Save or update a product record in the database.
+    Save or update a product record in the database (thread-safe).
 
     Args:
         product_url: The product URL
@@ -533,17 +543,18 @@ def save_product(product_url: str, collection_name: str,
         image_found: Whether an image was found for this product
     """
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            INSERT OR REPLACE INTO products
-            (product_url, collection_name, image_found, last_checked)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (product_url, collection_name, 1 if image_found else 0))
+            cursor.execute('''
+                INSERT OR REPLACE INTO products
+                (product_url, collection_name, image_found, last_checked)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (product_url, collection_name, 1 if image_found else 0))
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
     except sqlite3.Error as e:
         print(f"Database error saving product: {e}")
     except Exception as e:
@@ -557,7 +568,7 @@ def save_image(product_url: str, image_url: str, collection_name: str,
                downloaded: bool = False,
                uploaded: bool = False) -> None:
     """
-    Save or update an image record in the database.
+    Save or update an image record in the database (thread-safe).
 
     Args:
         product_url: The product URL
@@ -570,24 +581,25 @@ def save_image(product_url: str, image_url: str, collection_name: str,
         uploaded: Whether image was uploaded
     """
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
-        downloaded_at = datetime.now().isoformat() if downloaded else None
-        uploaded_at = datetime.now().isoformat() if uploaded else None
+            downloaded_at = datetime.now().isoformat() if downloaded else None
+            uploaded_at = datetime.now().isoformat() if uploaded else None
 
-        cursor.execute('''
-            INSERT OR REPLACE INTO images
-            (product_url, image_url, collection_name, local_path,
-             cloudinary_url, cloudinary_public_id, downloaded_at,
-             uploaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (product_url, image_url, collection_name, local_path,
-              cloudinary_url, cloudinary_public_id, downloaded_at,
-              uploaded_at))
+            cursor.execute('''
+                INSERT OR REPLACE INTO images
+                (product_url, image_url, collection_name, local_path,
+                 cloudinary_url, cloudinary_public_id, downloaded_at,
+                 uploaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (product_url, image_url, collection_name, local_path,
+                  cloudinary_url, cloudinary_public_id, downloaded_at,
+                  uploaded_at))
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
     except sqlite3.Error as e:
         print(f"Database error saving image: {e}")
     except Exception as e:
@@ -729,9 +741,7 @@ def main() -> None:
 
     # Extract images from each product
     print("\nStep 2: Extracting images from each product page...")
-    downloaded_count = 0
-    uploaded_count = 0
-    failed_count = 0
+    print(f"Using {MAX_WORKERS} worker threads for parallel processing...")
 
     # Check Cloudinary configuration
     use_cloudinary = False
@@ -753,133 +763,163 @@ def main() -> None:
             print(f"Cloudinary configuration error: {e}")
             print("Continuing without Cloudinary upload...")
 
-    for i, product_url in enumerate(product_links, 1):
-        print(f"\n[{i}/{len(product_links)}] Processing: {product_url}")
+    # Thread-safe counters
+    stats_lock = threading.Lock()
+    downloaded_count = 0
+    uploaded_count = 0
+    failed_count = 0
+    processed_count = 0
 
-        # Check if product already processed
-        if is_product_processed(product_url):
-            print("  [CACHED] Product already processed, skipping...")
-            continue
+    def process_product(product_url: str) -> Dict[str, int]:
+        """
+        Process a single product (worker function for threading).
 
-        # Extract collection name from URL
-        collection_name = extract_collection_name(product_url)
-        collection_dir = os.path.join(SAVE_DIR, collection_name)
-        print(f"  Collection: {collection_name}")
+        Args:
+            product_url: The product URL to process
 
-        image_url = extract_image_from_page(product_url)
+        Returns:
+            Dictionary with statistics for this product
+        """
+        result = {
+            'downloaded': 0,
+            'uploaded': 0,
+            'failed': 0
+        }
 
-        if image_url:
-            print(f"  Found image: {image_url}")
+        try:
+            # Check if product already processed
+            if is_product_processed(product_url):
+                return result
 
-            # Check if image already downloaded/uploaded
-            image_cached, cache_record = is_image_downloaded(
-                image_url, product_url
-            )
+            # Extract collection name from URL
+            collection_name = extract_collection_name(product_url)
+            collection_dir = os.path.join(SAVE_DIR, collection_name)
 
-            if image_cached:
-                print("  [CACHED] Image already processed")
+            image_url = extract_image_from_page(product_url)
+
+            if image_url:
+                # Check if image already downloaded/uploaded
+                image_cached, cache_record = is_image_downloaded(
+                    image_url, product_url
+                )
+
+                if image_cached:
+                    local_success = False
+                    if (cache_record and cache_record.get('local_path') and
+                            os.path.exists(cache_record['local_path'])):
+                        local_success = True
+                        result['downloaded'] = 1
+
+                    if cache_record and cache_record.get('cloudinary_url'):
+                        if use_cloudinary:
+                            result['uploaded'] = 1
+
+                    # Update product record
+                    save_product(product_url, collection_name,
+                                image_found=True)
+
+                    if local_success or (cache_record and
+                                         cache_record.get('cloudinary_url')):
+                        return result
+                    # If cached but files missing, re-download
+
+                # Generate filename from product URL or image URL
+                product_slug = (urlparse(product_url).path.split("/")[-1]
+                                or "product")
+                image_filename = (os.path.basename(urlparse(image_url).path)
+                                  or f"{product_slug}.jpg")
+
+                # Ensure .jpg extension
+                if not image_filename.endswith(".jpg"):
+                    image_filename = f"{product_slug}.jpg"
+
+                # Make filename safe
+                image_filename = re.sub(r'[^\w\-_\.]', '_', image_filename)
+
+                # Download image locally
+                filepath = os.path.join(collection_dir, image_filename)
                 local_success = False
-                if (cache_record and cache_record.get('local_path') and
-                        os.path.exists(cache_record['local_path'])):
-                    print(f"  Local file exists: "
-                          f"{cache_record['local_path']}")
+                if os.path.exists(filepath):
                     local_success = True
-                    downloaded_count += 1
-
-                if cache_record and cache_record.get('cloudinary_url'):
-                    print(f"  Cloudinary URL: "
-                          f"{cache_record['cloudinary_url']}")
-                    if use_cloudinary:
-                        uploaded_count += 1
-
-                # Update product record
-                save_product(product_url, collection_name, image_found=True)
-
-                if local_success or (cache_record and
-                                     cache_record.get('cloudinary_url')):
-                    continue
-                # If cached but files missing, re-download
-
-            # Generate filename from product URL or image URL
-            product_slug = (urlparse(product_url).path.split("/")[-1] or
-                            "product")
-            image_filename = (os.path.basename(urlparse(image_url).path) or
-                              f"{product_slug}.jpg")
-
-            # Ensure .jpg extension
-            if not image_filename.endswith(".jpg"):
-                image_filename = f"{product_slug}.jpg"
-
-            # Make filename safe
-            image_filename = re.sub(r'[^\w\-_\.]', '_', image_filename)
-
-            # Download image locally
-            filepath = os.path.join(collection_dir, image_filename)
-            local_success = False
-            if os.path.exists(filepath):
-                print(f"  Image already exists locally: "
-                      f"{collection_name}/{image_filename}")
-                local_success = True
-                downloaded_count += 1
-            else:
-                if download_image(image_url, image_filename, collection_dir):
-                    print(f"  Downloaded locally: "
-                          f"{collection_name}/{image_filename}")
-                    local_success = True
-                    downloaded_count += 1
+                    result['downloaded'] = 1
                 else:
-                    print("  Failed to download locally")
+                    if download_image(image_url, image_filename,
+                                     collection_dir):
+                        local_success = True
+                        result['downloaded'] = 1
 
-            # Upload to Cloudinary if configured
-            cloudinary_result = None
-            cloudinary_url = None
-            cloudinary_public_id = None
-            if use_cloudinary:
-                # Check if already uploaded (from cache)
-                if (cache_record and
-                        cache_record.get('cloudinary_url')):
-                    print("  [CACHED] Already uploaded to Cloudinary")
-                    cloudinary_url = cache_record['cloudinary_url']
-                    uploaded_count += 1
-                else:
-                    cloudinary_result = upload_to_cloudinary(
-                        image_url, collection_name
-                    )
-                    if cloudinary_result:
-                        cloudinary_url = cloudinary_result.get(
-                            'secure_url',
-                            cloudinary_result.get('url', '')
-                        )
-                        cloudinary_public_id = cloudinary_result.get(
-                            'public_id', ''
-                        )
-                        print(f"  Uploaded to Cloudinary: {cloudinary_url}")
-                        uploaded_count += 1
+                # Upload to Cloudinary if configured
+                cloudinary_url = None
+                cloudinary_public_id = None
+                if use_cloudinary:
+                    # Check if already uploaded (from cache)
+                    if (cache_record and
+                            cache_record.get('cloudinary_url')):
+                        cloudinary_url = cache_record['cloudinary_url']
+                        result['uploaded'] = 1
                     else:
-                        print("  Failed to upload to Cloudinary")
+                        cloudinary_result = upload_to_cloudinary(
+                            image_url, collection_name
+                        )
+                        if cloudinary_result:
+                            cloudinary_url = cloudinary_result.get(
+                                'secure_url',
+                                cloudinary_result.get('url', '')
+                            )
+                            cloudinary_public_id = cloudinary_result.get(
+                                'public_id', ''
+                            )
+                            result['uploaded'] = 1
 
-            # Save to database
-            save_product(product_url, collection_name, image_found=True)
-            save_image(
-                product_url=product_url,
-                image_url=image_url,
-                collection_name=collection_name,
-                local_path=filepath if local_success else None,
-                cloudinary_url=cloudinary_url,
-                cloudinary_public_id=cloudinary_public_id,
-                downloaded=local_success,
-                uploaded=bool(cloudinary_url)
-            )
+                # Save to database
+                save_product(product_url, collection_name, image_found=True)
+                save_image(
+                    product_url=product_url,
+                    image_url=image_url,
+                    collection_name=collection_name,
+                    local_path=filepath if local_success else None,
+                    cloudinary_url=cloudinary_url,
+                    cloudinary_public_id=cloudinary_public_id,
+                    downloaded=local_success,
+                    uploaded=bool(cloudinary_url)
+                )
 
-            if not local_success and not cloudinary_url:
-                failed_count += 1
-        else:
-            print("  No image found on this page")
-            save_product(product_url, collection_name, image_found=False)
-            failed_count += 1
+                if not local_success and not cloudinary_url:
+                    result['failed'] = 1
+            else:
+                save_product(product_url, collection_name, image_found=False)
+                result['failed'] = 1
+        except Exception as e:
+            print(f"Error processing {product_url}: {e}")
+            result['failed'] = 1
 
-        # Be polite - add a small delay between requests
-        time.sleep(REQUEST_DELAY)
+        return result
+
+    # Process products in parallel using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_url = {
+            executor.submit(process_product, url): url
+            for url in product_links
+        }
+
+        # Process completed tasks
+        for future in as_completed(future_to_url):
+            product_url = future_to_url[future]
+            try:
+                stats = future.result()
+                with stats_lock:
+                    downloaded_count += stats['downloaded']
+                    uploaded_count += stats['uploaded']
+                    failed_count += stats['failed']
+                    processed_count += 1
+                    print(f"[{processed_count}/{len(product_links)}] "
+                          f"Processed: {product_url[:60]}...")
+            except Exception as e:
+                with stats_lock:
+                    failed_count += 1
+                    processed_count += 1
+                print(f"Error processing {product_url}: {e}")
 
     print(f"\n{'='*60}")
     print("Extraction complete!")
